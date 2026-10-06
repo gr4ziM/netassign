@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NetAssign</title>
+  <link rel="stylesheet" href="app.css?v=@VERSION@">
+</head>
+<body>
+  <div class="sticky-head">
+  <header class="topbar">
+    <div class="brand">
+      <img src="../images/netassign_48.png" alt="" width="28" height="28">
+      <div>
+        <h1>NetAssign</h1>
+        <div id="host" class="muted">Loading…</div>
+      </div>
+    </div>
+    <div class="actions">
+      <span class="muted" title="NetAssign version">v@VERSION@</span>
+      <button id="refresh" type="button">Refresh</button>
+    </div>
+  </header>
+
+  <nav class="tabs" role="tablist">
+    <button role="tab" data-tab="summary" aria-selected="true">Summary</button>
+    <button role="tab" data-tab="interfaces">Interfaces</button>
+    <button role="tab" data-tab="firewall">Firewall</button>
+    <button role="tab" data-tab="services">Services</button>
+    <button role="tab" data-tab="assignment">Assignment</button>
+    <button role="tab" data-tab="helper">Helper</button>
+    <button role="tab" data-tab="diagnostics">Diagnostics</button>
+  </nav>
+  </div>
+
+  <main>
+    <div id="fatal" class="fatal" hidden></div>
+    <section id="tab-summary" class="tab" data-tab="summary"></section>
+    <section id="tab-interfaces" class="tab" data-tab="interfaces" hidden></section>
+    <section id="tab-firewall" class="tab" data-tab="firewall" hidden></section>
+    <section id="tab-services" class="tab" data-tab="services" hidden></section>
+    <section id="tab-assignment" class="tab" data-tab="assignment" hidden></section>
+    <section id="tab-helper" class="tab" data-tab="helper" hidden></section>
+    <section id="tab-diagnostics" class="tab" data-tab="diagnostics" hidden></section>
+  </main>
+
+  <script src="catalog.js?v=@VERSION@"></script>
+  <script src="model.js?v=@VERSION@"></script>
+  <script src="assign.js?v=@VERSION@"></script>
+  <script src="helper.js?v=@VERSION@"></script>
+  <script src="app.js?v=@VERSION@"></script>
+</body>
+</html>

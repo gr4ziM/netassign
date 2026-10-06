@@ -1,0 +1,4 @@
+#!/bin/sh
+# Install/upgrade/uninstall hook. The package itself installs
+# nothing outside the package directory, so there is nothing to do.
+exit 0

@@ -1,0 +1,22 @@
+{
+    "netassign.js": {
+        "SYNO.SDS.NetAssign.Instance": {
+            "type": "app",
+            "title": "NetAssign",
+            "version": "@VERSION@",
+            "icon": "images/netassign_{0}.png",
+            "appWindow": "SYNO.SDS.NetAssign.MainWindow",
+            "allowMultiInstance": false,
+            "allUsers": false,
+            "grantPrivilege": "local",
+            "advanceGrantPrivilege": true,
+            "depend": ["SYNO.SDS.NetAssign.MainWindow"]
+        },
+        "SYNO.SDS.NetAssign.MainWindow": {
+            "type": "lib",
+            "title": "NetAssign",
+            "icon": "images/netassign_{0}.png",
+            "depend": []
+        }
+    }
+}

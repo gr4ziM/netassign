@@ -1,0 +1,23 @@
+#!/bin/sh
+# NetAssign has no daemon: the UI is static files served by DSM itself.
+# "Running" only controls whether DSM shows the app in the main menu.
+
+FLAG="${SYNOPKG_PKGVAR:-/var/packages/NetAssign/var}/enabled"
+
+case "$1" in
+    start)
+        touch "$FLAG"
+        exit 0
+        ;;
+    stop)
+        rm -f "$FLAG"
+        exit 0
+        ;;
+    status)
+        [ -f "$FLAG" ] && exit 0
+        exit 3
+        ;;
+    *)
+        exit 1
+        ;;
+esac

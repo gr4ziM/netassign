@@ -1,0 +1,260 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>NetAssign model tests</title>
+  <style>
+    body { font: 13px/1.5 Consolas, monospace; margin: 16px; }
+    .pass { color: #1a7f37; } .fail { color: #b42318; font-weight: bold; }
+  </style>
+</head>
+<body>
+  <h1 id="summary">Running…</h1>
+  <ol id="results"></ol>
+  <script src="../model.js"></script>
+  <script>
+    "use strict";
+    const M = window.NA_MODEL;
+    const results = [];
+    function test(name, fn) {
+      try { fn(); results.push([true, name]); }
+      catch (e) { results.push([false, name + " — " + e.message]); }
+    }
+    function eq(actual, expected, what) {
+      const a = JSON.stringify(actual), b = JSON.stringify(expected);
+      if (a !== b) throw new Error(`${what || "value"}: expected ${b}, got ${a}`);
+    }
+    function has(list, re, what) {
+      if (!list.some((x) => re.test(x))) throw new Error(`${what}: no entry matches ${re} in ${JSON.stringify(list)}`);
+    }
+
+    // Example DiskStation: two Open vSwitch ports, example addresses.
+    const ETH = [
+      { ifname: "ovs_eth0", ip: "192.168.100.21", mask: "255.255.255.0", gateway: "192.168.100.4", enable_vlan: false, vlan_id: 0, is_default_gateway: false, status: "connected" },
+      { ifname: "ovs_eth1", ip: "192.168.20.21", mask: "255.255.255.0", gateway: "192.168.20.3", enable_vlan: false, vlan_id: 0, is_default_gateway: true, status: "connected" },
+    ];
+    const SERVICES = [
+      { id: "dsm", name: "DSM", group: "System", ports: [{ proto: "tcp", ports: "5000" }, { proto: "tcp", ports: "5001" }] },
+      { id: "smb", name: "SMB", group: "File services", ports: [{ proto: "tcp", ports: "445" }] },
+      { id: "webdav", name: "WebDAV", group: "File services", ports: [{ proto: "tcp", ports: "5005" }] },
+      { id: "portal:x", name: "App (Login Portal)", group: "Login Portal", ports: [{ proto: "tcp", ports: "8800" }] },
+    ];
+    const CTX = { physical: ["ovs_eth0", "ovs_eth1"], services: SERVICES, adminHost: "192.168.100.21" };
+
+    function target() {
+      return {
+        version: 1,
+        interfaces: {
+          ovs_eth0: { networks: [
+            { vlan: 100, tagged: false, address: "192.168.100.21/24", gateway: "192.168.100.4" },
+            { vlan: 131, tagged: true, address: "192.168.131.21/24", gateway: "192.168.131.4" },
+          ] },
+          ovs_eth1: { networks: [{ vlan: 150, tagged: false, address: "192.168.150.21/24", gateway: "192.168.150.4" }] },
+        },
+        defaultRoute: "ovs_eth0",
+        services: {
+          dsm: { mode: "networks", networks: ["ovs_eth0"], sources: ["192.168.100.0/24"] },
+          smb: { mode: "networks", networks: ["ovs_eth0.131"], sources: [] },
+          webdav: { mode: "networks", networks: ["ovs_eth1"], sources: ["192.168.110.31/32", "192.168.210.31/32"] },
+          "portal:x": { mode: "blocked", networks: [], sources: null },
+        },
+      };
+    }
+
+    test("parseCidr handles prefix, bare IP and garbage", () => {
+      const c = M.parseCidr("192.168.131.21/24");
+      eq([M.fmtIp(c.net), M.fmtIp(c.bcast), c.prefix], ["192.168.131.0", "192.168.131.255", 24]);
+      eq(M.parseCidr("10.1.2.3").prefix, 32, "bare IP");
+      eq(M.parseCidr("10.1.2.300/24"), null, "octet > 255");
+      eq(M.parseCidr("10.1.2.3/33"), null, "prefix > 32");
+      eq(M.parseCidr("10.1.2.3/24/1"), null, "two slashes");
+    });
+
+    test("maskToPrefix accepts contiguous masks only", () => {
+      eq(M.maskToPrefix("255.255.255.0"), 24);
+      eq(M.maskToPrefix("255.255.254.0"), 23);
+      eq(M.maskToPrefix("0.0.0.0"), 0);
+      eq(M.maskToPrefix("255.0.255.0"), null);
+    });
+
+    test("fromCurrent mirrors live interfaces and marks every service 'any'", () => {
+      const cur = M.fromCurrent(ETH, SERVICES);
+      eq(cur.interfaces.ovs_eth1.networks[0], { vlan: null, tagged: false, address: "192.168.20.21/24", gateway: "192.168.20.3" });
+      eq(cur.defaultRoute, "ovs_eth1");
+      eq(cur.services.smb, { mode: "any", networks: [], sources: [] });
+    });
+
+    test("the target state validates cleanly", () => {
+      const r = M.validate(target(), CTX);
+      eq(r.errors, [], "errors");
+    });
+
+    test("two untagged networks on one port are rejected", () => {
+      const p = target();
+      p.interfaces.ovs_eth0.networks[1].tagged = false;
+      has(M.validate(p, CTX).errors, /more than one untagged/, "errors");
+    });
+
+    test("overlapping subnets and out-of-subnet gateways are rejected", () => {
+      const p = target();
+      p.interfaces.ovs_eth1.networks[0].address = "192.168.100.50/16";
+      p.interfaces.ovs_eth1.networks[0].gateway = "172.16.0.1";
+      const r = M.validate(p, CTX);
+      has(r.errors, /overlapping/, "overlap");
+      has(r.errors, /outside/, "gateway");
+    });
+
+    test("network and broadcast addresses are rejected as interface addresses", () => {
+      const p = target();
+      p.interfaces.ovs_eth1.networks[0].address = "192.168.150.0/24";
+      has(M.validate(p, CTX).errors, /network or broadcast/, "errors");
+    });
+
+    test("missing default route is an error", () => {
+      const p = target();
+      p.defaultRoute = null;
+      has(M.validate(p, CTX).errors, /No default route/, "errors");
+    });
+
+    test("moving DSM off the address the admin uses is a lockout error", () => {
+      const p = target();
+      p.services.dsm.networks = ["ovs_eth1"];
+      has(M.validate(p, CTX).errors, /cut your current session/, "errors");
+    });
+
+    test("blocking DSM is a lockout error", () => {
+      const p = target();
+      p.services.dsm.mode = "blocked";
+      has(M.validate(p, CTX).errors, /lock yourself out/, "errors");
+    });
+
+    test("undecided sources are a warning, not an error", () => {
+      const p = target();
+      p.services.webdav.sources = null;
+      const r = M.validate(p, CTX);
+      eq(r.errors, [], "errors");
+      has(r.warnings, /not decided yet/, "warnings");
+    });
+
+    test("invalid source CIDR is an error", () => {
+      const p = target();
+      p.services.webdav.sources = ["proxy-host"];
+      has(M.validate(p, CTX).errors, /not an IPv4 address or subnet/, "errors");
+    });
+
+    test("Login Portal apps assigned away from DSM get an alias warning", () => {
+      const p = target();
+      p.services["portal:x"] = { mode: "networks", networks: ["ovs_eth1"], sources: [] };
+      has(M.validate(p, CTX).warnings, /alias/, "warnings");
+    });
+
+    // Live state as the UI sees it: DSM's interfaces plus the helper's
+    // managed sub-interfaces.
+    function liveWith(managed) {
+      const cur = M.fromCurrent(ETH, SERVICES);
+      for (const m of managed) cur.interfaces[m.bridge].networks.push({ vlan: m.vlan, tagged: true, address: m.address, gateway: m.gateway });
+      return cur;
+    }
+    const MANAGED_131 = { bridge: "ovs_eth0", vlan: 131, address: "192.168.131.21/24", gateway: "192.168.131.4" };
+    const byId = (changes) => Object.fromEntries(changes.map((c) => [c.id, c]));
+
+    test("changes: live -> target, only the new VLAN is applicable", () => {
+      const c = byId(M.diffChanges(liveWith([]), target(), SERVICES, []));
+      eq(c["net:ovs_eth0.131"].supported, true, "sub-interface supported");
+      eq(c["net:ovs_eth0.131"].ops, [{ op: "subif_add", bridge: "ovs_eth0", vlan: 131, address: "192.168.131.21/24", gateway: "192.168.131.4" }], "ops");
+      eq(c["net:ovs_eth1"].supported, false, "untagged readdress not supported");
+      eq(c["net:ovs_eth0"], undefined, "unchanged row has no change");
+      eq(c.route.supported, false, "route not supported");
+      eq(c["svc:dsm"].ops, [{ op: "fw_set", service: "dsm", ports: [{ proto: "tcp", ports: "5000" }, { proto: "tcp", ports: "5001" }], mode: "networks", networks: ["ovs_eth0"], sources: ["192.168.100.0/24"] }], "dsm policy");
+      eq([c["svc:smb"].supported, /ovs_eth0\.131/.test(c["svc:smb"].reason)], [false, true], "smb needs the VLAN to be live first");
+      eq(c["svc:portal:x"].ops[0].mode, "blocked", "blocked service");
+    });
+
+    test("changes: services — tbd equals unrestricted, undecided sources can't be applied, clearing works", () => {
+      const live = liveWith([]);
+      const p = JSON.parse(JSON.stringify(live));
+      p.services.dsm = { mode: "tbd", networks: [], sources: null };
+      eq(M.diffChanges(live, p, SERVICES, []), [], "tbd vs unrestricted is no change");
+      p.services.dsm = { mode: "networks", networks: ["ovs_eth0"], sources: null };
+      eq(byId(M.diffChanges(live, p, SERVICES, []))["svc:dsm"].supported, false, "sources tbd");
+      p.services.dsm = { mode: "networks", networks: [], sources: [] };
+      eq(byId(M.diffChanges(live, p, SERVICES, []))["svc:dsm"].supported, false, "no network");
+      const restricted = M.applyFirewall(JSON.parse(JSON.stringify(live)), { dsm: { mode: "networks", networks: ["ovs_eth0"], sources: [] } });
+      const back = JSON.parse(JSON.stringify(live));
+      eq(byId(M.diffChanges(restricted, back, SERVICES, []))["svc:dsm"].ops, [{ op: "fw_clear", service: "dsm" }], "clear");
+      eq(M.diffChanges(restricted, JSON.parse(JSON.stringify(restricted)), SERVICES, []), [], "live policy, same draft");
+    });
+
+    test("changes: editing a managed VLAN removes and re-adds it", () => {
+      const p = target();
+      p.interfaces.ovs_eth0.networks[1].gateway = null;
+      const c = byId(M.diffChanges(liveWith([MANAGED_131]), p, SERVICES, ["ovs_eth0.131"]));
+      eq(c["net:ovs_eth0.131"].ops.map((o) => o.op), ["subif_remove", "subif_add"]);
+    });
+
+    test("changes: dropping a managed VLAN is a supported removal; unmanaged ones are not", () => {
+      const p = target();
+      p.interfaces.ovs_eth0.networks.splice(1, 1);
+      const managed = byId(M.diffChanges(liveWith([MANAGED_131]), p, SERVICES, ["ovs_eth0.131"]));
+      eq([managed["net:ovs_eth0.131"].kind, managed["net:ovs_eth0.131"].supported], ["remove", true]);
+      const foreign = byId(M.diffChanges(liveWith([MANAGED_131]), p, SERVICES, []));
+      eq(foreign["net:ovs_eth0.131"].supported, false, "not created by NetAssign");
+    });
+
+    test("changes: invalid tagged networks are never applicable", () => {
+      const p = target();
+      p.interfaces.ovs_eth0.networks[1].address = "192.168.131.21";
+      eq(byId(M.diffChanges(liveWith([]), p, SERVICES, []))["net:ovs_eth0.131"].supported, false);
+      p.interfaces.ovs_eth0.networks[1].address = "192.168.131.21/24";
+      p.interfaces.ovs_eth0.networks[1].gateway = "192.168.100.4";
+      eq(byId(M.diffChanges(liveWith([]), p, SERVICES, []))["net:ovs_eth0.131"].supported, false, "gateway outside");
+    });
+
+    test("changes: identical draft has none; batchOps puts removals first", () => {
+      const live = liveWith([MANAGED_131]);
+      eq(M.diffChanges(live, JSON.parse(JSON.stringify(live)), SERVICES, ["ovs_eth0.131"]), []);
+      const ops = M.batchOps([
+        { supported: true, ops: [{ op: "fw_set", key: "f" }] },
+        { supported: true, ops: [{ op: "subif_add", key: "a" }] },
+        { supported: false, ops: [{ op: "subif_add", key: "x" }] },
+        { supported: true, ops: [{ op: "subif_remove", key: "b" }, { op: "subif_add", key: "b" }] },
+      ]);
+      eq(ops.map((o) => `${o.op}:${o.key}`), ["subif_remove:b", "subif_add:a", "subif_add:b", "fw_set:f"]);
+    });
+
+    test("firewall rules: one per service port and source; blocked services get none", () => {
+      const rules = M.firewallRules(target(), SERVICES);
+      eq(rules.get("ovs_eth0").map((r) => `${r.service}:${r.ports}:${r.source}`), ["dsm:5000:192.168.100.0/24", "dsm:5001:192.168.100.0/24"]);
+      eq(rules.get("ovs_eth0.131").map((r) => r.source), ["any"]);
+      eq(rules.get("ovs_eth1").length, 2, "webdav x2 sources");
+      eq([...rules.values()].flat().some((r) => r.service === "portal:x"), false, "blocked service");
+    });
+
+    test("firewall rules keep undecided sources as 'tbd', never 'any'", () => {
+      const p = target();
+      p.services.dsm.sources = null;
+      eq([...new Set(M.firewallRules(p, SERVICES).get("ovs_eth0").map((r) => r.source))], ["tbd"]);
+    });
+
+    test("mergeServices adds missing services as tbd and drops unknown ones", () => {
+      const p = target();
+      delete p.services.smb;
+      p.services.ghost = { mode: "any", networks: [], sources: [] };
+      const m = M.mergeServices(p, SERVICES);
+      eq(m.plan.services.smb, { mode: "tbd", networks: [], sources: null });
+      eq(m.dropped, ["ghost"]);
+    });
+
+    const list = document.getElementById("results");
+    for (const [ok, name] of results) {
+      const li = document.createElement("li");
+      li.className = ok ? "pass" : "fail";
+      li.textContent = (ok ? "PASS " : "FAIL ") + name;
+      list.append(li);
+    }
+    const failed = results.filter((r) => !r[0]).length;
+    document.getElementById("summary").textContent = failed ? `${failed} of ${results.length} FAILED` : `All ${results.length} passed`;
+    window.TEST_RESULT = { total: results.length, failed, failures: results.filter((r) => !r[0]).map((r) => r[1]) };
+  </script>
+</body>
+</html>

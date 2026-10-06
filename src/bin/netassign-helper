@@ -1,0 +1,1146 @@
+#!/usr/bin/python3
+"""NetAssign root helper.
+
+DSM 7 packages cannot run as root, so everything that needs root runs
+here.
+
+Trust model. DSM installs package files owned by the unprivileged
+package user, so root must never execute the copy inside the package.
+The administrator installs a root-owned copy explicitly, once per
+package version (as root, e.g. over SSH):
+
+    /var/packages/NetAssign/target/bin/netassign-helper install
+
+which copies this file to /usr/local/libexec/netassign/ (root:root, 0755)
+and starts it. The Task Scheduler boot-up task (user root) then runs
+only that copy:
+
+    /usr/local/libexec/netassign/netassign-helper start
+
+`start`/`daemon` refuse to run from any file or directory that someone
+other than root could modify.
+
+Request flow. The package's CGI (package user, after verifying a DSM
+administrator session) drops request files into
+/var/packages/NetAssign/var/requests/. The daemon validates them
+strictly and writes results to .../var/results/. Both directories are
+writable by the package user, so the daemon never follows symlinks
+there: requests are opened with O_NOFOLLOW, results are written to a
+freshly created temp file (O_EXCL|O_NOFOLLOW, ownership set via the file
+descriptor) and renamed into place. Log and lock live in root-owned
+locations.
+
+Actions:
+    status        read-only capture of OVS, addresses, routing, iptables
+    subif_apply   add one VLAN sub-interface: an Open vSwitch internal
+                  port with a VLAN tag on an existing ovs_ethN bridge,
+                  its address, and a source-based route table. Purely
+                  additive; reverts on its own unless confirmed within
+                  CONFIRM_SECONDS. A snapshot is taken first.
+    subif_remove  remove a sub-interface NetAssign created
+    apply_batch   several changes as one unit — sub-interface
+                  additions/removals and per-service firewall policies
+                  (fw_set / fw_clear) — with one snapshot, one
+                  confirmation, one revert; refuses a firewall that would
+                  drop the administrator's own connection (the UI uses
+                  this for both per-row Apply and Apply all)
+    confirm       keep the pending change
+    revert        undo the pending change now
+Managed sub-interfaces are recorded in a root-only state file and
+recreated whenever they go missing (boot, DSM network restarts).
+
+Commands:
+    install  copy this file to the root-owned location and (re)start it
+    start    detach a daemon (Task Scheduler boot-up task) and exit
+    daemon   run in the foreground
+    stop     stop a running daemon
+    status   print the read-only status report to stdout
+    uninstall  remove sub-interfaces, the firewall chain, state and the
+               root-owned copy (run before uninstalling the package)
+
+Python 3.8 (DSM's system interpreter), standard library only.
+"""
+
+import fcntl
+import json
+import os
+import re
+import shutil
+import signal
+import stat
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+HELPER_VERSION = "@VERSION@"
+
+PKG = "NetAssign"
+PKG_DIR = Path("/var/packages") / PKG
+INFO = PKG_DIR / "INFO"
+# DSM 7 makes this a symlink to /volume1/@appdata/NetAssign. The daemon
+# resolves it once (see resolve_var) and then works on the real path.
+VAR_LINK = PKG_DIR / "var"
+VAR = REQUESTS = RESULTS = HEARTBEAT = None
+
+INSTALL_DIR = Path("/usr/local/libexec/netassign")
+INSTALLED = INSTALL_DIR / "netassign-helper"
+LOCK = Path("/run/netassign-helper.lock")
+PIDFILE = Path("/run/netassign-helper.pid")
+LOG = Path("/var/log/netassign-helper.log")
+
+POLL_SECONDS = 2
+MAX_REQUEST_BYTES = 64 * 1024
+KEEP_RESULTS = 20
+LOG_MAX_BYTES = 512 * 1024
+REQUEST_ID = re.compile(r"^[0-9a-f]{16,32}$")
+ACTIONS = {"status", "subif_apply", "subif_remove", "apply_batch", "confirm", "revert"}
+
+
+def package_version():
+    try:
+        m = re.search(r'^version="([^"]*)"', INFO.read_text(), re.M)
+        return m.group(1) if m else "unknown"
+    except OSError:
+        return "unknown"
+
+
+def log(msg):
+    try:
+        if LOG.exists() and LOG.stat().st_size > LOG_MAX_BYTES:
+            os.replace(str(LOG), str(LOG) + ".1")
+        with open(str(LOG), "a") as f:
+            f.write("%s [%d] %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), os.getpid(), msg))
+    except OSError:
+        pass
+
+
+def require_root():
+    if os.geteuid() != 0:
+        sys.exit("netassign-helper must run as root")
+
+
+def root_only(path):
+    """True if only root can modify `path` (file or directory)."""
+    st = os.lstat(str(path))
+    return st.st_uid == 0 and not (st.st_mode & (stat.S_IWGRP | stat.S_IWOTH)) and not stat.S_ISLNK(st.st_mode)
+
+
+def check_trusted_location():
+    me = Path(os.path.realpath(__file__))
+    if me != INSTALLED:
+        sys.exit(
+            "refusing to run from %s: run '%s install' as root, then start %s" % (me, me, INSTALLED)
+        )
+    for p in (INSTALLED, INSTALL_DIR, INSTALL_DIR.parent):
+        if not root_only(p):
+            sys.exit("refusing to run: %s is modifiable by someone other than root" % p)
+
+
+# ---------------------------------------------------------------- files
+
+def resolve_var():
+    """Resolve the package's var directory without trusting anything the
+    package user controls.
+
+    /var/packages/<pkg> must be root-only, so the package user cannot
+    swap the entry (a real directory, or DSM 7's root-owned symlink to
+    /volume1/@appdata/<pkg>). The resolved target must be a real
+    directory inside a root-only parent; only its contents belong to
+    the package user.
+    """
+    global VAR, REQUESTS, RESULTS, HEARTBEAT
+    if not root_only(PKG_DIR):
+        raise RuntimeError("%s is modifiable by someone other than root" % PKG_DIR)
+    st = os.lstat(str(VAR_LINK))
+    if stat.S_ISLNK(st.st_mode) and st.st_uid != 0:
+        raise RuntimeError("%s is a symlink not owned by root" % VAR_LINK)
+    real = Path(os.path.realpath(str(VAR_LINK)))
+    if not stat.S_ISDIR(os.lstat(str(real)).st_mode):
+        raise RuntimeError("%s does not resolve to a directory" % VAR_LINK)
+    if not root_only(real.parent):
+        raise RuntimeError("%s is modifiable by someone other than root" % real.parent)
+    VAR = real
+    REQUESTS = VAR / "requests"
+    RESULTS = VAR / "results"
+    HEARTBEAT = VAR / "helper.json"
+
+
+def package_owner():
+    st = os.lstat(str(VAR))
+    if not stat.S_ISDIR(st.st_mode):
+        raise RuntimeError("%s is not a directory" % VAR)
+    return st.st_uid, st.st_gid
+
+
+def ensure_exchange_dirs():
+    """requests/ and results/ must be real directories owned by the
+    package user (the CGI writes requests, reads results)."""
+    uid, gid = package_owner()
+    for d in (REQUESTS, RESULTS):
+        try:
+            st = os.lstat(str(d))
+        except FileNotFoundError:
+            os.mkdir(str(d), 0o750)
+            st = os.lstat(str(d))
+        if not stat.S_ISDIR(st.st_mode):
+            raise RuntimeError("%s is not a real directory (symlink?)" % d)
+        os.chown(str(d), uid, gid, follow_symlinks=False)
+        os.chmod(str(d), 0o750)
+
+
+def write_json(path, obj):
+    """Atomically write `path` (in a package-user-writable directory)
+    without ever following a planted name."""
+    uid, gid = package_owner()
+    tmp = path.with_name(".%s.%d.tmp" % (path.name, os.getpid()))
+    fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o640)
+    try:
+        os.fchown(fd, uid, gid)
+        with os.fdopen(fd, "w") as f:
+            json.dump(obj, f, indent=1, sort_keys=True)
+        os.replace(str(tmp), str(path))
+    except BaseException:
+        try:
+            os.unlink(str(tmp))
+        except OSError:
+            pass
+        raise
+
+
+def read_request(path):
+    fd = os.open(str(path), os.O_RDONLY | os.O_NOFOLLOW)
+    with os.fdopen(fd, "rb") as f:
+        raw = f.read(MAX_REQUEST_BYTES + 1)
+    if len(raw) > MAX_REQUEST_BYTES:
+        raise ValueError("request too large")
+    req = json.loads(raw.decode("utf-8"))
+    if not isinstance(req, dict):
+        raise ValueError("request is not an object")
+    if not REQUEST_ID.match(str(req.get("id", ""))) or req["id"] != path.stem:
+        raise ValueError("invalid request id")
+    if req.get("action") not in ACTIONS:
+        raise ValueError("unsupported action %r" % req.get("action"))
+    return req
+
+
+# ---------------------------------------------------------------- actions
+
+def run(argv, timeout=15):
+    try:
+        p = subprocess.run(
+            argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout, universal_newlines=True
+        )
+        return {"argv": argv, "exit_code": p.returncode, "stdout": p.stdout[-20000:], "stderr": p.stderr[-4000:]}
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return {"argv": argv, "exit_code": None, "stdout": "", "stderr": str(e)}
+
+
+STATUS_CHECKS = {
+    "ovs_show": ["ovs-vsctl", "show"],
+    "ip_addr": ["ip", "-4", "-o", "addr", "show"],
+    "ip_rule": ["ip", "rule", "show"],
+    "ip_route_all": ["ip", "route", "show", "table", "all"],
+    "iptables": ["iptables", "-S"],
+    "synowebapi_ethernet": ["synowebapi", "--exec", "api=SYNO.Core.Network.Ethernet", "method=list", "version=2"],
+}
+
+
+def action_status(_req):
+    """Read-only: everything NetAssign can change, captured as-is."""
+    data = {name: run(argv) for name, argv in STATUS_CHECKS.items()}
+    data["managed"] = {"argv": ["(netassign state)"], "exit_code": 0, "stderr": "",
+                       "stdout": json.dumps({"subinterfaces": load_state()["subinterfaces"], "pending": load_pending()}, indent=1)}
+    return data
+
+
+# ---------------------------------------------------------------- state
+#
+# Desired state and pending changes live in a root-only directory: the
+# package user must not be able to influence what root re-applies at
+# boot except through validated requests.
+
+STATE_DIR = Path("/usr/local/etc/netassign")
+STATE_FILE = STATE_DIR / "state.json"
+PENDING_FILE = STATE_DIR / "pending.json"
+SNAPSHOT_DIR = STATE_DIR / "snapshots"
+CONFIRM_SECONDS = 300
+RECONCILE_SECONDS = 30
+RULE_PRIORITY = 900          # after DSM's own rules (0, 2, 3, 4…), before main (32766)
+TABLE_BASE = 20000           # numeric tables, clear of DSM's named ones
+KEEP_SNAPSHOTS = 30
+
+
+def ensure_state_dir():
+    for d in (STATE_DIR, SNAPSHOT_DIR):
+        d.mkdir(mode=0o700, parents=True, exist_ok=True)
+        os.chown(str(d), 0, 0)
+        os.chmod(str(d), 0o700)
+
+
+def write_root_json(path, obj):
+    tmp = path.with_name(".%s.%d.tmp" % (path.name, os.getpid()))
+    with open(str(tmp), "w") as f:
+        json.dump(obj, f, indent=1, sort_keys=True)
+    os.chmod(str(tmp), 0o600)
+    os.replace(str(tmp), str(path))
+
+
+def load_state():
+    try:
+        state = json.loads(STATE_FILE.read_text())
+        if isinstance(state.get("subinterfaces"), list):
+            state.setdefault("firewall", {})
+            return state
+    except (OSError, ValueError):
+        pass
+    return {"version": 1, "subinterfaces": [], "firewall": {}}
+
+
+def load_pending():
+    try:
+        return json.loads(PENDING_FILE.read_text())
+    except (OSError, ValueError):
+        return None
+
+
+def take_snapshot(reason):
+    snap = {"reason": reason, "time": time.time(), "captures": {k: run(v) for k, v in STATUS_CHECKS.items()}}
+    path = SNAPSHOT_DIR / ("%d.json" % int(time.time() * 1000))
+    write_root_json(path, snap)
+    for old in sorted(SNAPSHOT_DIR.glob("*.json"))[:-KEEP_SNAPSHOTS]:
+        try:
+            old.unlink()
+        except OSError:
+            pass
+    return path.name
+
+
+# ---------------------------------------------------------------- sub-interfaces
+
+BRIDGE_NAME = re.compile(r"^ovs_eth(\d{1,2})$")
+
+
+def parse_cidr(text):
+    m = re.match(r"^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})/(\d{1,2})$", str(text or ""))
+    if not m:
+        raise ValueError("invalid address %r (expected a.b.c.d/nn)" % text)
+    octets = [int(x) for x in m.groups()[:4]]
+    prefix = int(m.group(5))
+    if any(o > 255 for o in octets) or not 8 <= prefix <= 30:
+        raise ValueError("invalid address %r" % text)
+    ip = (octets[0] << 24) | (octets[1] << 16) | (octets[2] << 8) | octets[3]
+    mask = (0xFFFFFFFF << (32 - prefix)) & 0xFFFFFFFF
+    net = ip & mask
+    if ip in (net, net | (~mask & 0xFFFFFFFF)):
+        raise ValueError("%s is a network or broadcast address" % text)
+    return ip, prefix, net, mask
+
+
+def fmt_ip(n):
+    return ".".join(str((n >> s) & 255) for s in (24, 16, 8, 0))
+
+
+def parse_ip(text):
+    m = re.match(r"^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$", str(text or ""))
+    if not m or any(int(x) > 255 for x in m.groups()):
+        raise ValueError("invalid IPv4 address %r" % text)
+    a, b, c, d = (int(x) for x in m.groups())
+    return (a << 24) | (b << 16) | (c << 8) | d
+
+
+def system_addresses():
+    """[(ifname, ip, prefix)] for every IPv4 address on the system."""
+    out = run(["ip", "-4", "-o", "addr", "show"])["stdout"]
+    found = []
+    for line in out.splitlines():
+        m = re.search(r"^\d+:\s+(\S+)\s+inet\s+(\d+\.\d+\.\d+\.\d+)/(\d+)", line)
+        if m:
+            found.append((m.group(1), parse_ip(m.group(2)), int(m.group(3))))
+    return found
+
+
+def validate_subif(params):
+    """Turn untrusted request params into a fully specified item."""
+    if not isinstance(params, dict):
+        raise ValueError("params must be an object")
+    bridge = str(params.get("bridge", ""))
+    m = BRIDGE_NAME.match(bridge)
+    if not m:
+        raise ValueError("bridge must look like ovs_ethN, got %r" % bridge)
+    bridges = run(["ovs-vsctl", "list-br"])["stdout"].split()
+    if bridge not in bridges:
+        raise ValueError("Open vSwitch bridge %s does not exist (have: %s)" % (bridge, ", ".join(bridges)))
+    vlan = params.get("vlan")
+    if not isinstance(vlan, int) or isinstance(vlan, bool) or not 2 <= vlan <= 4094:
+        raise ValueError("vlan must be an integer between 2 and 4094")
+    ip, prefix, net, mask = parse_cidr(params.get("address"))
+    gateway = params.get("gateway")
+    if gateway is not None:
+        gw = parse_ip(gateway)
+        if gw & mask != net or gw == ip:
+            raise ValueError("gateway %s is not a usable address in %s" % (gateway, params.get("address")))
+        gateway = fmt_ip(gw)
+    ifname = "na%sv%d" % (m.group(1), vlan)           # e.g. na0v131 (<= 15 chars)
+    return {
+        "key": "%s.%d" % (bridge, vlan),
+        "bridge": bridge,
+        "vlan": vlan,
+        "ifname": ifname,
+        "address": "%s/%d" % (fmt_ip(ip), prefix),
+        "network": "%s/%d" % (fmt_ip(net), prefix),
+        "ip": fmt_ip(ip),
+        "gateway": gateway,
+        "table": TABLE_BASE + vlan,
+    }
+
+
+def check_conflicts(item, state, ignore_ifnames=()):
+    """`ignore_ifnames`: interfaces the same batch removes first."""
+    ip = parse_ip(item["ip"])
+    _, prefix, net, mask = parse_cidr(item["address"])
+    for other in state["subinterfaces"]:
+        if other["key"] == item["key"]:
+            raise ValueError("%s is already managed by NetAssign" % item["key"])
+    for ifname, other_ip, other_prefix in system_addresses():
+        if ifname == item["ifname"] or ifname in ignore_ifnames:
+            continue
+        other_mask = (0xFFFFFFFF << (32 - other_prefix)) & 0xFFFFFFFF
+        if other_ip == ip:
+            raise ValueError("%s is already configured on %s" % (item["ip"], ifname))
+        if (other_ip & mask) == net or (ip & other_mask) == (other_ip & other_mask):
+            raise ValueError("%s overlaps the subnet on %s" % (item["network"], ifname))
+
+
+def subif_up_commands(item):
+    cmds = [
+        ["ovs-vsctl", "--may-exist", "add-port", item["bridge"], item["ifname"], "tag=%d" % item["vlan"],
+         "--", "set", "Interface", item["ifname"], "type=internal"],
+        ["ip", "link", "set", "dev", item["ifname"], "up"],
+        ["ip", "addr", "replace", item["address"], "dev", item["ifname"]],
+        ["ip", "route", "replace", item["network"], "dev", item["ifname"], "src", item["ip"], "table", str(item["table"])],
+    ]
+    if item["gateway"]:
+        cmds.append(["ip", "route", "replace", "default", "via", item["gateway"], "dev", item["ifname"],
+                     "table", str(item["table"])])
+    return cmds
+
+
+def rule_present(item):
+    out = run(["ip", "rule", "show"])["stdout"]
+    return re.search(r"from %s lookup %d\b" % (re.escape(item["ip"]), item["table"]), out) is not None
+
+
+def subif_up(item):
+    """Bring one sub-interface up; on any failure tear it down again."""
+    log_lines = []
+    for argv in subif_up_commands(item):
+        r = run(argv)
+        log_lines.append(r)
+        if r["exit_code"] != 0:
+            subif_down(item)
+            raise RuntimeError("%s failed: %s" % (" ".join(argv), r["stderr"].strip()))
+    if not rule_present(item):
+        r = run(["ip", "rule", "add", "from", item["ip"], "lookup", str(item["table"]), "priority", str(RULE_PRIORITY)])
+        log_lines.append(r)
+        if r["exit_code"] != 0:
+            subif_down(item)
+            raise RuntimeError("ip rule add failed: %s" % r["stderr"].strip())
+    return log_lines
+
+
+def subif_down(item):
+    steps = []
+    while rule_present(item):
+        r = run(["ip", "rule", "del", "from", item["ip"], "lookup", str(item["table"])])
+        steps.append(r)
+        if r["exit_code"] != 0:
+            break
+    steps.append(run(["ip", "route", "flush", "table", str(item["table"])]))
+    steps.append(run(["ovs-vsctl", "--if-exists", "del-port", item["bridge"], item["ifname"]]))
+    return steps
+
+
+def subif_present(item):
+    link = run(["ip", "-4", "-o", "addr", "show", "dev", item["ifname"]])
+    return link["exit_code"] == 0 and (item["address"] in link["stdout"]) and rule_present(item)
+
+
+def verify_subif(item):
+    checks = {"addr": run(["ip", "-4", "-o", "addr", "show", "dev", item["ifname"]])}
+    if item["gateway"]:
+        checks["ping_gateway"] = run(["ping", "-c", "2", "-W", "2", "-I", item["ip"], item["gateway"]], timeout=10)
+    return checks
+
+
+def action_subif_apply(req):
+    if load_pending():
+        raise RuntimeError("another change is waiting for confirmation; confirm or revert it first")
+    state = load_state()
+    item = validate_subif(req.get("params"))
+    check_conflicts(item, state)
+    snapshot = take_snapshot("before subif_apply %s" % item["key"])
+    steps = subif_up(item)
+    state["subinterfaces"].append(item)
+    write_root_json(STATE_FILE, state)
+    deadline = time.time() + CONFIRM_SECONDS
+    write_root_json(PENDING_FILE, {"kind": "subif_apply", "key": item["key"], "deadline": deadline,
+                                   "snapshot": snapshot, "requested_by": req.get("user")})
+    log("applied %s (%s on %s, tag %d); auto-revert at %s" % (
+        item["key"], item["address"], item["ifname"], item["vlan"], time.strftime("%H:%M:%S", time.localtime(deadline))))
+    return {"item": item, "snapshot": snapshot, "deadline": deadline, "steps": steps, "verify": verify_subif(item)}
+
+
+def revert_pending(reason):
+    pending = load_pending()
+    if not pending:
+        raise RuntimeError("nothing is pending")
+    state = load_state()
+    if pending["kind"] == "subif_apply":
+        items = [i for i in state["subinterfaces"] if i["key"] == pending["key"]]
+        steps = [s for i in items for s in subif_down(i)]
+        state["subinterfaces"] = [i for i in state["subinterfaces"] if i["key"] != pending["key"]]
+        write_root_json(STATE_FILE, state)
+    elif pending["kind"] == "batch":
+        added = set(pending["added"])
+        steps = [s for i in state["subinterfaces"] if i["key"] in added for s in subif_down(i)]
+        state["subinterfaces"] = [i for i in state["subinterfaces"] if i["key"] not in added]
+        for item in pending["removed"]:
+            steps += subif_up(item)
+            state["subinterfaces"].append(item)
+        if "fw_before" in pending:
+            state["firewall"] = pending["fw_before"]
+            steps += fw_apply(state)
+        write_root_json(STATE_FILE, state)
+    else:
+        raise RuntimeError("unknown pending change %r" % pending["kind"])
+    PENDING_FILE.unlink()
+    log("reverted %s (%s)" % (pending["key"], reason))
+    return {"reverted": pending, "steps": steps}
+
+
+def action_confirm(_req):
+    pending = load_pending()
+    if not pending:
+        raise RuntimeError("nothing is pending")
+    PENDING_FILE.unlink()
+    log("confirmed %s" % pending["key"])
+    return {"confirmed": pending}
+
+
+def action_revert(_req):
+    return revert_pending("reverted by request")
+
+
+def action_subif_remove(req):
+    if load_pending():
+        raise RuntimeError("another change is waiting for confirmation; confirm or revert it first")
+    params = req.get("params") or {}
+    key = str(params.get("key", ""))
+    state = load_state()
+    items = [i for i in state["subinterfaces"] if i["key"] == key]
+    if not items:
+        raise ValueError("%s is not managed by NetAssign" % key)
+    snapshot = take_snapshot("before subif_remove %s" % key)
+    steps = [s for i in items for s in subif_down(i)]
+    state["subinterfaces"] = [i for i in state["subinterfaces"] if i["key"] != key]
+    write_root_json(STATE_FILE, state)
+    log("removed %s" % key)
+    return {"removed": key, "snapshot": snapshot, "steps": steps}
+
+
+# ---------------------------------------------------------------- firewall
+#
+# Per-service restrictions in a dedicated iptables chain, jumped to
+# from the top of INPUT (DSM relocates that jump into its own
+# DEFAULT_INPUT chain, which is just as effective — see jump_chains()).
+# Default is allow: a service without a policy
+# is untouched. A policy says on which NetAssign-known networks (OVS
+# bridges and managed sub-interfaces) a service's ports are reachable,
+# optionally only from given sources; on every other known network
+# they are dropped. Loopback, Docker's own bridge and replies to
+# connections the NAS opened itself are never filtered. IPv4 only.
+# DSM rebuilds INPUT on network changes, so reconcile() re-applies the
+# chain whenever it drifts.
+
+CHAIN = "NETASSIGN"
+SERVICE_ID = re.compile(r"^[A-Za-z0-9_.:\-]{1,80}$")
+PORT_SPEC = re.compile(r"^\d{1,5}(-\d{1,5})?(,\d{1,5}(-\d{1,5})?)*$")
+MAX_SOURCES = 32
+_fw_fingerprint = None
+
+
+def parse_port_spec(spec):
+    if not PORT_SPEC.match(str(spec)):
+        raise ValueError("invalid port list %r" % spec)
+    slots = 0
+    for part in spec.split(","):
+        lo, _, hi = part.partition("-")
+        lo, hi = int(lo), int(hi or lo)
+        if not 1 <= lo <= hi <= 65535:
+            raise ValueError("invalid port range %r" % part)
+        slots += 2 if lo != hi else 1
+    if slots > 15:
+        raise ValueError("port list %r exceeds iptables multiport's 15 slots" % spec)
+    return spec
+
+
+def parse_source(text):
+    """a.b.c.d or a.b.c.d/nn -> normalized network 'a.b.c.d/nn'."""
+    addr, _, prefix = str(text or "").partition("/")
+    ip = parse_ip(addr)
+    prefix = int(prefix) if prefix.isdigit() else (32 if prefix == "" else -1)
+    if not 0 <= prefix <= 32:
+        raise ValueError("invalid source %r" % text)
+    mask = (0xFFFFFFFF << (32 - prefix)) & 0xFFFFFFFF if prefix else 0
+    return "%s/%d" % (fmt_ip(ip & mask), prefix)
+
+
+def validate_policy(op):
+    sid = str(op.get("service", ""))
+    if not SERVICE_ID.match(sid):
+        raise ValueError("invalid service id %r" % sid)
+    ports = op.get("ports")
+    if not isinstance(ports, list) or not 1 <= len(ports) <= 8:
+        raise ValueError("%s: ports must list 1-8 entries" % sid)
+    norm_ports = []
+    for p in ports:
+        proto = p.get("proto") if isinstance(p, dict) else None
+        if proto not in ("tcp", "udp"):
+            raise ValueError("%s: protocol must be tcp or udp" % sid)
+        norm_ports.append({"proto": proto, "ports": parse_port_spec(p.get("ports"))})
+    mode = op.get("mode")
+    if mode not in ("networks", "any", "blocked"):
+        raise ValueError("%s: invalid mode %r" % (sid, mode))
+    networks = op.get("networks") or []
+    if not isinstance(networks, list) or not all(isinstance(k, str) for k in networks):
+        raise ValueError("%s: networks must be a list of network keys" % sid)
+    if mode == "networks" and not networks:
+        raise ValueError("%s: select at least one network" % sid)
+    sources = op.get("sources") or []
+    if not isinstance(sources, list) or len(sources) > MAX_SOURCES:
+        raise ValueError("%s: sources must be a list of up to %d networks" % (sid, MAX_SOURCES))
+    sources = sorted({parse_source(s) for s in sources})
+    if mode == "any" and not sources:
+        raise ValueError("%s: 'all networks from any source' is no restriction; clear it instead" % sid)
+    return {"service": sid, "ports": norm_ports, "mode": mode,
+            "networks": sorted(set(networks)) if mode == "networks" else [], "sources": sources if mode != "blocked" else []}
+
+
+PLAIN_PORT = re.compile(r"^(eth|bond)\d{1,2}$")
+SYS_NET = Path("/sys/class/net")
+
+
+def net_devices():
+    """[(name, enslaved)] for every network device; `enslaved` is True
+    when the device belongs to a bond or to Open vSwitch."""
+    try:
+        names = sorted(os.listdir(str(SYS_NET)))
+    except OSError:
+        return []
+    return [(n, os.path.lexists(str(SYS_NET / n / "master"))) for n in names]
+
+
+def base_networks():
+    """network key -> Linux interface for DSM's own ports: Open vSwitch
+    bridges (ovs_ethN) when OVS is enabled, otherwise the plain ports
+    (ethN, bondN) that carry traffic themselves."""
+    known = {br: br for br in run(["ovs-vsctl", "list-br"])["stdout"].split() if BRIDGE_NAME.match(br)}
+    for name, enslaved in net_devices():
+        if PLAIN_PORT.match(name) and not enslaved:
+            known[name] = name
+    return known
+
+
+def known_networks(state):
+    """network key -> Linux interface for every network NetAssign filters."""
+    known = base_networks()
+    for item in state["subinterfaces"]:
+        known[item["key"]] = item["ifname"]
+    return known
+
+
+def allowed_networks(policy, known):
+    if policy["mode"] == "blocked":
+        return set()
+    if policy["mode"] == "any":
+        return set(known)
+    return set(policy["networks"]) & set(known)
+
+
+def chain_rules(state, established):
+    """iptables argument lists (after `-A NETASSIGN`) for the policies."""
+    known = known_networks(state)
+    rules = [["-i", "lo", "-j", "RETURN"], established + ["-j", "RETURN"]]
+    for sid in sorted(state["firewall"]):
+        policy = state["firewall"][sid]
+        allowed = allowed_networks(policy, known)
+        for key, ifname in sorted(known.items()):
+            for p in policy["ports"]:
+                match = ["-i", ifname, "-p", p["proto"], "-m", "multiport", "--dports", p["ports"].replace("-", ":")]
+                if key in allowed:
+                    if not policy["sources"]:
+                        continue                      # reachable here from anywhere
+                    for src in policy["sources"]:
+                        rules.append(match[:2] + ["-s", src] + match[2:] + ["-j", "RETURN"])
+                rules.append(match + ["-j", "DROP"])
+    return rules
+
+
+def ip_in(ip, network):
+    net, _, prefix = network.partition("/")
+    prefix = int(prefix)
+    mask = (0xFFFFFFFF << (32 - prefix)) & 0xFFFFFFFF if prefix else 0
+    return parse_ip(ip) & mask == parse_ip(net) & mask
+
+
+def port_in(port, spec):
+    for part in spec.split(","):
+        lo, _, hi = part.partition("-")
+        if int(lo) <= port <= int(hi or lo):
+            return True
+    return False
+
+
+def check_lockout(state, origin):
+    """Refuse a firewall that would drop the administrator's own
+    connection: client -> server_addr:server_port (passed by api.cgi)."""
+    if not isinstance(origin, dict):
+        return
+    try:
+        client, server = origin.get("client"), origin.get("server_addr")
+        port = int(origin.get("server_port"))
+        parse_ip(client)
+    except (TypeError, ValueError):
+        return                                       # not IPv4 (e.g. IPv6): nothing to check here
+    known = known_networks(state)
+    by_ifname = {v: k for k, v in known.items()}
+    arrival = None
+    for ifname, ip, _ in system_addresses():
+        if fmt_ip(ip) == server and ifname in by_ifname:
+            arrival = by_ifname[ifname]
+    if arrival is None:
+        return
+    for sid, policy in state["firewall"].items():
+        if not any(p["proto"] == "tcp" and port_in(port, p["ports"]) for p in policy["ports"]):
+            continue
+        ok = arrival in allowed_networks(policy, known) and (
+            not policy["sources"] or any(ip_in(client, s) for s in policy["sources"]))
+        if not ok:
+            raise RuntimeError(
+                "refused: %s would block your own connection (%s -> %s:%d on %s)" % (sid, client, server, port, arrival))
+
+
+def established_match():
+    """conntrack where available, the older state match otherwise."""
+    for match in (["-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED"], ["-m", "state", "--state", "ESTABLISHED,RELATED"]):
+        probe = run(["iptables", "-C", "INPUT"] + match + ["-j", "RETURN"])
+        if "No chain/target/match" not in probe["stderr"] and "Couldn't load match" not in probe["stderr"]:
+            return match
+    raise RuntimeError("neither the conntrack nor the state iptables match is available")
+
+
+def must(result):
+    if result["exit_code"] != 0:
+        raise RuntimeError("%s failed: %s" % (" ".join(result["argv"]), result["stderr"].strip()))
+    return result
+
+
+def jump_chains():
+    """Chains that jump to NETASSIGN. We insert the jump into INPUT, but
+    DSM relocates it into its own DEFAULT_INPUT chain (observed on DSM
+    7.4-90075); either placement is effective, so look everywhere."""
+    jump = re.compile(r"^-A (\S+) -j %s$" % CHAIN)
+    return [m.group(1) for m in (jump.match(line.strip()) for line in run(["iptables", "-S"])["stdout"].splitlines()) if m]
+
+
+def fw_apply(state):
+    """Make the NETASSIGN chain and the jump to it match `state`."""
+    global _fw_fingerprint
+    steps = []
+    if not state["firewall"]:
+        for chain in jump_chains():
+            steps.append(run(["iptables", "-D", chain, "-j", CHAIN]))
+        if run(["iptables", "-n", "-L", CHAIN])["exit_code"] == 0:
+            steps.append(run(["iptables", "-F", CHAIN]))
+            steps.append(run(["iptables", "-X", CHAIN]))
+        _fw_fingerprint = None
+        return steps
+    if run(["iptables", "-n", "-L", CHAIN])["exit_code"] != 0:
+        steps.append(must(run(["iptables", "-N", CHAIN])))
+    steps.append(must(run(["iptables", "-F", CHAIN])))
+    try:
+        for rule in chain_rules(state, established_match()):
+            steps.append(must(run(["iptables", "-A", CHAIN] + rule)))
+    except Exception:
+        run(["iptables", "-F", CHAIN])               # half a chain is worse than none
+        raise
+    if not jump_chains():
+        steps.append(must(run(["iptables", "-I", "INPUT", "1", "-j", CHAIN])))
+    _fw_fingerprint = run(["iptables", "-S", CHAIN])["stdout"]
+    return steps
+
+
+def fw_reconcile(state):
+    if not state["firewall"]:
+        return
+    if jump_chains() and _fw_fingerprint is not None and run(["iptables", "-S", CHAIN])["stdout"] == _fw_fingerprint:
+        return
+    fw_apply(state)
+    log("firewall chain re-applied")
+
+
+MAX_BATCH_OPS = 32
+
+
+def action_apply_batch(req):
+    """Apply several changes as one unit: one snapshot, one
+    confirmation, one revert. ops:
+        {"op": "subif_remove", "key"}
+        {"op": "subif_add", bridge, vlan, address, gateway}
+        {"op": "fw_set", service, ports, mode, networks, sources}
+        {"op": "fw_clear", service}
+    Sub-interface removals run first, then additions, then the firewall
+    chain is rebuilt — so a policy may refer to a VLAN added in the same
+    batch."""
+    if load_pending():
+        raise RuntimeError("another change is waiting for confirmation; confirm or revert it first")
+    params = req.get("params") or {}
+    ops = params.get("ops")
+    if not isinstance(ops, list) or not 1 <= len(ops) <= MAX_BATCH_OPS:
+        raise ValueError("ops must be a list of 1-%d operations" % MAX_BATCH_OPS)
+    state = load_state()
+    managed = {i["key"]: i for i in state["subinterfaces"]}
+    removes, adds, fw_sets, fw_clears = [], [], [], []
+    for op in ops:
+        kind = op.get("op") if isinstance(op, dict) else None
+        if kind == "subif_remove":
+            key = str(op.get("key", ""))
+            if key not in managed:
+                raise ValueError("%s is not managed by NetAssign" % key)
+            if any(r["key"] == key for r in removes):
+                raise ValueError("%s is removed twice" % key)
+            removes.append(managed[key])
+        elif kind == "subif_add":
+            adds.append(validate_subif(op))
+        elif kind == "fw_set":
+            fw_sets.append(validate_policy(op))
+        elif kind == "fw_clear":
+            sid = str(op.get("service", ""))
+            if sid not in state["firewall"]:
+                raise ValueError("%s has no NetAssign firewall policy" % sid)
+            fw_clears.append(sid)
+        else:
+            raise ValueError("unsupported operation %r" % kind)
+
+    removed_keys = {r["key"] for r in removes}
+    remaining = {"subinterfaces": [i for i in state["subinterfaces"] if i["key"] not in removed_keys]}
+    ignore = {r["ifname"] for r in removes}
+    for n, item in enumerate(adds):
+        check_conflicts(item, remaining, ignore)
+        for other in adds[:n]:
+            _, _, net_a, mask_a = parse_cidr(item["address"])
+            _, _, net_b, mask_b = parse_cidr(other["address"])
+            if other["key"] == item["key"] or net_a & mask_b == net_b or net_b & mask_a == net_a:
+                raise ValueError("%s conflicts with %s in the same batch" % (item["key"], other["key"]))
+
+    # The state after this batch, validated as a whole before anything runs.
+    fw_before = json.loads(json.dumps(state["firewall"]))
+    new_state = {"version": 1, "subinterfaces": remaining["subinterfaces"] + adds, "firewall": dict(fw_before)}
+    for sid in fw_clears:
+        del new_state["firewall"][sid]
+    for policy in fw_sets:
+        new_state["firewall"][policy["service"]] = policy
+    known_after = set(base_networks()) | {
+        i["key"] for i in new_state["subinterfaces"]}
+    for policy in fw_sets:
+        missing = [k for k in policy["networks"] if k not in known_after]
+        if missing:
+            raise ValueError("%s: unknown network(s) %s" % (policy["service"], ", ".join(missing)))
+    check_lockout(new_state, params.get("origin"))
+    touches_fw = bool(fw_sets or fw_clears or (fw_before and (removes or adds)))
+
+    fw_keys = ["fw:" + p["service"] for p in fw_sets] + ["fw:" + s for s in fw_clears]
+    snapshot = take_snapshot("before apply_batch %s" % ", ".join(sorted(removed_keys | {a["key"] for a in adds}) + fw_keys))
+    steps, done_removed, done_added = [], [], []
+    try:
+        for item in removes:
+            steps += subif_down(item)
+            done_removed.append(item)
+        for item in adds:
+            steps += subif_up(item)          # tears itself down on failure
+            done_added.append(item)
+        if touches_fw:
+            steps += fw_apply(new_state)
+    except Exception:
+        for item in done_added:
+            subif_down(item)
+        for item in done_removed:
+            try:
+                subif_up(item)
+            except Exception as e:
+                log("rollback could not restore %s: %s" % (item["key"], e))
+        if touches_fw:
+            try:
+                fw_apply(state)
+            except Exception as e:
+                log("rollback could not restore the firewall chain: %s" % e)
+        raise
+
+    write_root_json(STATE_FILE, new_state)
+    keys = sorted(removed_keys | {a["key"] for a in adds}) + fw_keys
+    deadline = time.time() + CONFIRM_SECONDS
+    pending = {
+        "kind": "batch", "key": ", ".join(keys), "keys": keys,
+        "added": [a["key"] for a in adds], "removed": removes,
+        "deadline": deadline, "snapshot": snapshot, "requested_by": req.get("user"),
+    }
+    if touches_fw:
+        pending["fw_before"] = fw_before
+    label = params.get("label")
+    if isinstance(label, str) and label.strip():
+        pending["label"] = "".join(c for c in label if c.isprintable())[:200]   # display only
+    write_root_json(PENDING_FILE, pending)
+    log("applied batch %s; auto-revert at %s" % (", ".join(keys), time.strftime("%H:%M:%S", time.localtime(deadline))))
+    verify = {}
+    for item in adds:
+        for name, out in verify_subif(item).items():
+            verify["%s %s" % (item["key"], name)] = out
+    return {"added": adds, "removed": [r["key"] for r in removes], "snapshot": snapshot,
+            "deadline": deadline, "steps": steps, "verify": verify}
+
+
+def reconcile():
+    """Recreate managed sub-interfaces that are missing (boot, DSM
+    network restarts). Called from the daemon loop."""
+    state = load_state()
+    for item in state["subinterfaces"]:
+        if not subif_present(item):
+            try:
+                subif_up(item)
+                log("re-created %s" % item["key"])
+            except Exception as e:
+                log("could not re-create %s: %s" % (item["key"], e))
+    try:
+        fw_reconcile(state)
+    except Exception as e:
+        log("could not re-apply the firewall chain: %s" % e)
+
+
+def expire_pending():
+    pending = load_pending()
+    if pending and time.time() > float(pending.get("deadline", 0)):
+        try:
+            revert_pending("not confirmed within %d s" % CONFIRM_SECONDS)
+        except Exception as e:
+            log("auto-revert failed: %s" % e)
+
+
+HANDLERS = {
+    "status": action_status,
+    "subif_apply": action_subif_apply,
+    "subif_remove": action_subif_remove,
+    "apply_batch": action_apply_batch,
+    "confirm": action_confirm,
+    "revert": action_revert,
+}
+
+
+def process(path):
+    started = time.time()
+    rid = path.stem
+    try:
+        req = read_request(path)
+        data = HANDLERS[req["action"]](req)
+        result = {"id": rid, "action": req["action"], "ok": True, "data": data}
+    except Exception as e:  # every failure goes back to the UI
+        result = {"id": rid, "ok": False, "error": "%s: %s" % (type(e).__name__, e)}
+    result.update({"started": started, "finished": time.time(), "helper_version": HELPER_VERSION})
+    if REQUEST_ID.match(rid):
+        write_json(RESULTS / ("%s.json" % rid), result)
+    log("request %s -> %s" % (rid, "ok" if result["ok"] else result["error"]))
+
+
+def prune_results():
+    files = sorted(RESULTS.glob("*.json"), key=lambda p: p.lstat().st_mtime, reverse=True)
+    for p in files[KEEP_RESULTS:]:
+        try:
+            p.unlink()
+        except OSError:
+            pass
+
+
+# ---------------------------------------------------------------- daemon
+
+_stop = False
+
+
+def _on_term(_signum, _frame):
+    global _stop
+    _stop = True
+
+
+def daemon():
+    require_root()
+    check_trusted_location()
+    if not os.path.lexists(str(VAR_LINK)):
+        sys.exit("%s missing — is the NetAssign package installed?" % VAR_LINK)
+    resolve_var()
+    lock = open(str(LOCK), "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        sys.exit("netassign-helper is already running")
+    PIDFILE.write_text(str(os.getpid()))
+    signal.signal(signal.SIGTERM, _on_term)
+
+    ensure_exchange_dirs()
+    ensure_state_dir()
+    started = time.time()
+    last_reconcile = 0.0
+    log("helper %s started" % HELPER_VERSION)
+    while not _stop:
+        if not os.path.lexists(str(VAR_LINK)) or not VAR.is_dir():
+            log("package removed, exiting")
+            break
+        # Unconfirmed changes revert on their own, even if the UI is gone.
+        expire_pending()
+        if time.time() - last_reconcile >= RECONCILE_SECONDS:
+            reconcile()
+            last_reconcile = time.time()
+        write_json(HEARTBEAT, {
+            "pid": os.getpid(),
+            "version": HELPER_VERSION,
+            "package_version": package_version(),
+            "started": started,
+            "heartbeat": time.time(),
+            "actions": sorted(ACTIONS),
+            "managed": load_state()["subinterfaces"],
+            "firewall": load_state()["firewall"],
+            "pending": load_pending(),
+        })
+        # lstat: a planted dangling symlink must not crash the loop.
+        for path in sorted(REQUESTS.glob("*.json"), key=lambda p: p.lstat().st_mtime):
+            try:
+                process(path)
+            finally:
+                try:
+                    path.unlink()
+                except OSError:
+                    pass
+        prune_results()
+        time.sleep(POLL_SECONDS)
+    log("helper stopped")
+    try:
+        PIDFILE.unlink()
+    except OSError:
+        pass
+
+
+def start():
+    """Detach a daemon and return, so the Task Scheduler task finishes."""
+    require_root()
+    check_trusted_location()
+    pid = os.fork()
+    if pid:
+        print("netassign-helper %s started (pid %d)" % (HELPER_VERSION, pid))
+        return
+    os.setsid()
+    devnull = os.open(os.devnull, os.O_RDWR)
+    for fd in (0, 1, 2):
+        os.dup2(devnull, fd)
+    try:
+        daemon()
+    except SystemExit as e:
+        log("helper exited: %s" % e)
+    except Exception as e:
+        log("helper crashed: %s: %s" % (type(e).__name__, e))
+    os._exit(0)
+
+
+def stop():
+    require_root()
+    try:
+        pid = int(PIDFILE.read_text().strip())
+    except (OSError, ValueError):
+        print("not running")
+        return
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        print("not running")
+        return
+    for _ in range(20):
+        time.sleep(POLL_SECONDS / 4)
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            print("stopped")
+            return
+    sys.exit("pid %d did not stop" % pid)
+
+
+def install():
+    """Copy this file to the root-owned location, then restart from it."""
+    require_root()
+    src = Path(os.path.realpath(__file__))
+    INSTALL_DIR.mkdir(mode=0o755, parents=True, exist_ok=True)
+    os.chown(str(INSTALL_DIR), 0, 0)
+    os.chmod(str(INSTALL_DIR), 0o755)
+    tmp = INSTALL_DIR / (".netassign-helper.%d.tmp" % os.getpid())
+    shutil.copyfile(str(src), str(tmp))
+    os.chown(str(tmp), 0, 0)
+    os.chmod(str(tmp), 0o755)
+    os.replace(str(tmp), str(INSTALLED))
+    print("installed %s %s" % (INSTALLED, HELPER_VERSION))
+    stop()
+    os.execv(sys.executable, [sys.executable, str(INSTALLED), "start"])
+
+
+def uninstall():
+    """Undo everything NetAssign set up: stop the daemon, remove managed
+    sub-interfaces and the firewall chain, delete the root-owned helper
+    copy, its state and its log. Run before removing the package."""
+    require_root()
+    stop()
+    state = load_state()
+    for item in state["subinterfaces"]:
+        subif_down(item)
+        print("removed sub-interface %s (%s)" % (item["key"], item["ifname"]))
+    fw_apply({"subinterfaces": [], "firewall": {}})
+    print("removed the %s firewall chain" % CHAIN)
+    shutil.rmtree(str(STATE_DIR), ignore_errors=True)
+    for p in (INSTALLED, LOG, Path(str(LOG) + ".1"), PIDFILE, LOCK):
+        try:
+            p.unlink()
+        except OSError:
+            pass
+    try:
+        INSTALL_DIR.rmdir()
+    except OSError:
+        pass
+    print("NetAssign helper removed. Delete the 'NetAssign helper' task in Task Scheduler, "
+          "then uninstall the package in Package Center.")
+
+
+def main():
+    cmd = sys.argv[1] if len(sys.argv) > 1 else ""
+    if cmd == "install":
+        install()
+    elif cmd == "start":
+        start()
+    elif cmd == "daemon":
+        daemon()
+    elif cmd == "stop":
+        stop()
+    elif cmd == "status":
+        json.dump(action_status({}), sys.stdout, indent=1)
+        print()
+    elif cmd == "uninstall":
+        uninstall()
+    else:
+        sys.exit(__doc__)
+
+
+if __name__ == "__main__":
+    main()
