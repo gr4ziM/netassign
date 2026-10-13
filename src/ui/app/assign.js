@@ -82,25 +82,27 @@
     }, 0);
   }
 
+  function loadDraft(text, name) {
+    try {
+      const parsed = JSON.parse(text);
+      const plan = parsed.plan || parsed;
+      if (!plan || typeof plan !== "object" || !plan.interfaces) throw new Error("no 'interfaces' section");
+      const merged = M.mergeServices(plan, state.services);
+      state.draft = merged.plan;
+      state.origin = `imported ${name}`;
+      state.importInfo = parsed.notes || parsed.description ? { name: parsed.name, description: parsed.description, notes: parsed.notes || [] } : null;
+      state.notice = merged.dropped.length
+        ? `Ignored assignments for services not present on this DiskStation: ${merged.dropped.join(", ")}.`
+        : "";
+    } catch (e) {
+      state.notice = `Import failed: ${e.message || e}`;
+    }
+    render();
+  }
+
   function importDraft(file) {
     const reader = new FileReader();
-    reader.onload = () => {
-      try {
-        const parsed = JSON.parse(reader.result);
-        const plan = parsed.plan || parsed;
-        if (!plan || typeof plan !== "object" || !plan.interfaces) throw new Error("no 'interfaces' section");
-        const merged = M.mergeServices(plan, state.services);
-        state.draft = merged.plan;
-        state.origin = `imported ${file.name}`;
-        state.importInfo = parsed.notes || parsed.description ? { name: parsed.name, description: parsed.description, notes: parsed.notes || [] } : null;
-        state.notice = merged.dropped.length
-          ? `Ignored assignments for services not present on this DiskStation: ${merged.dropped.join(", ")}.`
-          : "";
-      } catch (e) {
-        state.notice = `Import failed: ${e.message || e}`;
-      }
-      render();
-    };
+    reader.onload = () => loadDraft(reader.result, file.name);
     reader.readAsText(file);
   }
 
@@ -585,6 +587,13 @@
     if (!state.draft) {
       state.draft = clone(current());
       state.origin = "the current configuration";
+      // Local preview only: ?plan=<file> starts with that plan as the draft.
+      const demo = window.NA_UI.mock && new URLSearchParams(location.search).get("plan");
+      if (demo) {
+        fetch(demo, { cache: "no-store" })
+          .then((r) => r.text())
+          .then((t) => loadDraft(t, demo.split("/").pop()));
+      }
     }
     render();
   }

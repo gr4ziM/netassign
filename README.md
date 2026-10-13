@@ -1,7 +1,13 @@
+<p align="center">
+  <img src="docs/images/logo.png" alt="NetAssign logo" width="128" height="128">
+</p>
+
 # NetAssign
 
 **Decide which DSM services are reachable on which network — on your
 Synology DiskStation, from the DSM desktop.**
+
+![The Assignment tab with a new VLAN sub-interface and two service restrictions waiting to be applied](docs/images/assignment.png)
 
 NetAssign is a DSM 7 app for administrators. It does three things:
 
@@ -27,6 +33,62 @@ NetAssign is a DSM 7 app for administrators. It does three things:
 > the [user guide](docs/user-guide.md) first, and keep another way to
 > reach your NAS (a second interface or physical access) while you
 > experiment.
+
+## Screenshots
+
+The screenshots use demo data.
+
+| Tab | What it shows |
+|---|---|
+| **Summary** | Findings and an overview of system, network, firewall and services |
+| **Interfaces** | Every physical interface with address, gateway, DNS, VLAN, MTU and attached virtual switches |
+| **Firewall** | DSM firewall state and all profiles with their per-interface rules |
+| **Services** | Every DSM and package service with its live ports and where it is reachable |
+| **Assignment** | The draft: networks per port and service restrictions, with per-row **Apply** and **Apply all** |
+| **Helper** | Root helper status, the sub-interfaces and service restrictions NetAssign manages |
+| **Diagnostics** | The DSM Web API calls behind the status tabs, with results and timings |
+
+<details>
+<summary><strong>Summary</strong></summary>
+
+![Summary tab](docs/images/summary.png)
+</details>
+
+<details>
+<summary><strong>Interfaces</strong></summary>
+
+![Interfaces tab](docs/images/interfaces.png)
+</details>
+
+<details>
+<summary><strong>Firewall</strong></summary>
+
+![Firewall tab](docs/images/firewall.png)
+</details>
+
+<details>
+<summary><strong>Services</strong></summary>
+
+![Services tab](docs/images/services.png)
+</details>
+
+<details>
+<summary><strong>Assignment</strong></summary>
+
+![Assignment tab](docs/images/assignment.png)
+</details>
+
+<details>
+<summary><strong>Helper</strong></summary>
+
+![Helper tab](docs/images/helper.png)
+</details>
+
+<details>
+<summary><strong>Diagnostics</strong></summary>
+
+![Diagnostics tab](docs/images/diagnostics.png)
+</details>
 
 ## Quick start
 

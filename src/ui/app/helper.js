@@ -116,6 +116,21 @@
   async function refresh() {
     safeRender();
     if (window.NA_UI.mock) {
+      if (!state.mockSeeded) {
+        // Optional mock/helper-state.json: {"managed": [...], "firewall": {...}}
+        // as the helper's starting state.
+        state.mockSeeded = true;
+        try {
+          const r = await fetch("mock/helper-state.json", { cache: "no-store" });
+          if (r.ok) {
+            const seed = await r.json();
+            state.mockManaged = seed.managed || [];
+            state.mockFirewall = seed.firewall || {};
+          }
+        } catch (e) {
+          // No seed file — start empty.
+        }
+      }
       const alive = new URLSearchParams(location.search).get("helper") === "alive";
       const now = Date.now() / 1000;
       state.info = alive

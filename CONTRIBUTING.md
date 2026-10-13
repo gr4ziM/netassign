@@ -50,6 +50,18 @@ firewall profiles under `"SYNO.Core.Security.Firewall.Profile.get.v1:<name>"`.
 Add `&helper=alive` to simulate a running helper. Fixtures captured
 from a real NAS contain network details, so `mock/` is gitignored.
 
+More preview-only options:
+
+- `&tab=<name>` opens a tab (`summary`, `interfaces`, `firewall`,
+  `services`, `assignment`, `helper`, `diagnostics`).
+- `&plan=<file>` starts the Assignment tab with that plan file as the
+  draft, e.g. `&plan=mock/demo-plan.json`.
+- `mock/helper-state.json` (optional), shaped
+  `{"managed": [...], "firewall": {...}}`, is the simulated helper's
+  starting state.
+
+The screenshots in `docs/images/` were taken this way, with demo data.
+
 ```bash
 python build.py --preview-icons                    # writes src/ui/images/ (gitignored)
 python -m http.server 8765 --directory src/ui      # open /app/index.html?mock=1

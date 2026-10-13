@@ -641,6 +641,8 @@
   } catch (e) {
     // Storage unavailable — start on the summary tab.
   }
+  // Local preview only: ?tab=<name> opens that tab.
+  if (MOCK) initial = new URLSearchParams(location.search).get("tab") || initial;
   selectTab(initial);
   refresh();
 })();
